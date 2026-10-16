@@ -1,0 +1,330 @@
+# Multi-stage CI/CD pipeline - Django REST API + React/Vite frontend + PostgreSQL
+# Stages: CI -> Security Scan (Trivy) -> Database Backup -> Deploy Test -> Start App -> Deploy Production
+#
+# Secrets (JWT_SECRET, DB_PASSWORD1) are Azure DevOps secret variables: they are never stored in this file.
+# The "production" environment has a manual approval check configured in Azure DevOps
+# (Environments > production > Approvals and checks), so Stage 6 waits for a reviewer.
+# Machine names have been replaced by SELF-HOSTED-AGENT for publication.
+
+trigger:
+  - main
+
+stages:
+
+  # ─── STAGE 1 : CI (BACKEND + FRONTEND) ──────────────────────
+  - stage: CI
+    displayName: 'CI - Backend & Frontend'
+    jobs:
+      - deployment: BuildAll
+        displayName: 'Install & Build (Django + React)'
+        environment:
+          name: 'capex'
+          resourceName: 'SELF-HOSTED-AGENT'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                # ---- Backend Django ----
+                - task: UsePythonVersion@0
+                  inputs:
+                    versionSpec: '3.11'
+                  displayName: 'Setup Python 3.11'
+
+                - script: |
+                    pip install -r requirements.txt
+                  displayName: 'Install Python dependencies'
+                  workingDirectory: '$(Build.SourcesDirectory)/backend-django'
+
+                - script: |
+                    python manage.py check
+                  displayName: 'Django system check'
+                  workingDirectory: '$(Build.SourcesDirectory)/backend-django'
+                  env:
+                    # dummy values: 'manage.py check' only validates settings, it does not connect to a real database
+                    JWT_SECRET: 'test-secret-key-for-ci'
+                    DB_HOST: 'localhost'
+                    DB_PORT: '5432'
+                    DB_DATABASE: 'capex_db'
+                    DB_USER: 'postgres'
+                    DB_PASSWORD: 'postgres'
+                    DJANGO_DEBUG: 'True'
+
+                # ---- Migration Django (base réelle) ----
+                - script: |
+                    python manage.py migrate --noinput
+                  displayName: 'Apply Django migrations'
+                  workingDirectory: '$(Build.SourcesDirectory)/backend-django'
+                  env:
+                    JWT_SECRET: '$(JWT_SECRET)'
+                    DB_HOST: 'localhost'
+                    DB_PORT: '5432'
+                    DB_DATABASE: 'capex_platform'
+                    DB_USER: 'postgres'
+                    DB_PASSWORD: '$(DB_PASSWORD1)'
+                    DJANGO_DEBUG: 'False'
+
+                # ---- Frontend React ----
+                - task: NodeTool@0
+                  inputs:
+                    versionSpec: '20.x'
+                  displayName: 'Setup Node.js 20'
+
+                - script: |
+                    npm install
+                  displayName: 'Install npm dependencies'
+                  workingDirectory: '$(Build.SourcesDirectory)/front'
+
+                - script: |
+                    npm run build
+                  displayName: 'Build React app (Vite)'
+                  workingDirectory: '$(Build.SourcesDirectory)/front'
+
+                - task: PublishPipelineArtifact@1
+                  inputs:
+                    targetPath: '$(Build.SourcesDirectory)/front/dist'
+                    artifact: 'frontend-dist'
+                  displayName: 'Publish frontend build artifact'
+
+  # ─── STAGE 2 : SECURITY SCAN (TRIVY) ────────────────────────
+  - stage: Security_Scan
+    displayName: 'Security Scan - Trivy'
+    dependsOn: CI
+    jobs:
+      - deployment: TrivyScan
+        displayName: 'Trivy Vulnerability Scan'
+        environment:
+          name: 'capex'
+          resourceName: 'SELF-HOSTED-AGENT'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - powershell: |
+                    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                    $trivyVersion = "0.72.0"
+                    $extractPath = "C:\trivy"
+                    if (Test-Path "$extractPath\trivy.exe") {
+                        Write-Host "Trivy already installed, skipping download."
+                    } else {
+                        Write-Host "Downloading Trivy..."
+                        $url = "https://github.com/aquasecurity/trivy/releases/download/v$trivyVersion/trivy_${trivyVersion}_Windows-64bit.zip"
+                        $zipPath = "$env:TEMP\trivy.zip"
+                        Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
+                        Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+                        Write-Host "Trivy installed."
+                    }
+                    echo "##vso[task.prependpath]$extractPath"
+                  displayName: 'Install Trivy (if needed)'
+
+                - powershell: |
+                    trivy fs --severity HIGH,CRITICAL --exit-code 0 --format table $(Build.SourcesDirectory)/backend-django
+                  displayName: 'Trivy scan - Backend Django'
+
+                - powershell: |
+                    trivy fs --severity HIGH,CRITICAL --exit-code 0 --format table $(Build.SourcesDirectory)/front
+                  displayName: 'Trivy scan - Frontend React'
+
+  # ─── STAGE 3 : DATABASE BACKUP ───────────────────────────────
+  - stage: DB_Backup
+    displayName: 'Database Backup - PostgreSQL'
+    dependsOn: Security_Scan
+    jobs:
+      - deployment: BackupDB
+        displayName: 'Backup capex_platform DB'
+        environment:
+          name: 'capex'
+          resourceName: 'SELF-HOSTED-AGENT'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - powershell: |
+                    $backupDir = "C:\azagent\A1\backups"
+                    if (!(Test-Path $backupDir)) {
+                        New-Item -ItemType Directory -Path $backupDir | Out-Null
+                    }
+                    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+                    $backupFile = "$backupDir\capex_platform_backup_$timestamp.dump"
+
+                    $env:PGPASSWORD = "$(DB_PASSWORD1)"
+                    pg_dump -U postgres -d capex_platform -F c -f "$backupFile"
+
+                    if (Test-Path $backupFile) {
+                        Write-Host "Backup created successfully: $backupFile"
+                    } else {
+                        Write-Host "##vso[task.logissue type=error]Backup failed!"
+                        exit 1
+                    }
+                  displayName: 'Run pg_dump backup'
+
+  # ─── STAGE 4 : DEPLOY TO TEST-SERVER ─────────────────────────
+  - stage: Deploy
+    displayName: 'Deploy - Test Server'
+    dependsOn: DB_Backup
+    jobs:
+      - deployment: DeployToTestServer
+        displayName: 'Copy build to C:\Test-server'
+        environment:
+          name: 'capex'
+          resourceName: 'SELF-HOSTED-AGENT'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: DownloadPipelineArtifact@2
+                  inputs:
+                    artifact: 'frontend-dist'
+                    path: '$(Pipeline.Workspace)/frontend-dist'
+                  displayName: 'Download frontend build artifact'
+
+                - powershell: |
+                    $target = "C:\Test-server"
+                    if (!(Test-Path $target)) {
+                        New-Item -ItemType Directory -Path $target | Out-Null
+                    }
+
+                    # Backend Django (checkout frais du repo)
+                    robocopy "$(Build.SourcesDirectory)\backend-django" "$target\backend-django" /MIR /XD venv __pycache__ .git
+                    if ($LASTEXITCODE -ge 8) {
+                        Write-Host "##vso[task.logissue type=error]Robocopy backend failed with code $LASTEXITCODE"
+                        exit 1
+                    }
+
+                    # Frontend (artifact téléchargé depuis le stage CI)
+                    robocopy "$(Pipeline.Workspace)\frontend-dist" "$target\front\dist" /MIR
+                    if ($LASTEXITCODE -ge 8) {
+                        Write-Host "##vso[task.logissue type=error]Robocopy frontend failed with code $LASTEXITCODE"
+                        exit 1
+                    }
+
+                    Write-Host "Déploiement terminé vers $target"
+                    exit 0
+                  displayName: 'Copy artifacts to Test-server'
+
+  # ─── STAGE 5 : START APPLICATION (TEST) ──────────────────────
+  - stage: Start_App
+    displayName: 'Start Application'
+    dependsOn: Deploy
+    jobs:
+      - deployment: StartApp
+        displayName: 'Generate .env and restart services'
+        environment:
+          name: 'capex'
+          resourceName: 'SELF-HOSTED-AGENT'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: none
+
+                - powershell: |
+                    $envContent = @"
+                    JWT_SECRET=$(JWT_SECRET)
+                    DB_HOST=localhost
+                    DB_PORT=5432
+                    DB_DATABASE=capex_platform
+                    DB_USER=postgres
+                    DB_PASSWORD=$(DB_PASSWORD1)
+                    DJANGO_DEBUG=False
+                    CORS_ORIGIN=http://localhost:5173
+                    FRONTEND_URL=http://localhost:5173
+                    "@
+                    Set-Content -Path "C:\Test-server\backend-django\.env" -Value $envContent
+                    Write-Host ".env généré avec succès"
+                  displayName: 'Generate .env file'
+
+                - powershell: |
+                    schtasks /end /tn "CapexBackend" 2>$null
+                    schtasks /end /tn "CapexFrontend" 2>$null
+                    Start-Sleep -Seconds 2
+                    schtasks /run /tn "CapexBackend"
+                    schtasks /run /tn "CapexFrontend"
+                    Start-Sleep -Seconds 8
+                    Write-Host "=================================="
+                    Write-Host "Application déployée avec succès !"
+                    Write-Host "URL : http://localhost:5173"
+                    Write-Host "=================================="
+                  displayName: 'Restart services and print URL'
+
+  # ─── STAGE 6 : DEPLOY TO PRODUCTION ──────────────────────────
+  - stage: Deploy_Production
+    displayName: 'Deploy - Production'
+    dependsOn: Start_App
+    jobs:
+      - deployment: DeployProd
+        displayName: 'Copy build to C:\Production'
+        environment:
+          name: 'production'
+          resourceName: 'SELF-HOSTED-AGENT'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: DownloadPipelineArtifact@2
+                  inputs:
+                    artifact: 'frontend-dist'
+                    path: '$(Pipeline.Workspace)/frontend-dist'
+                  displayName: 'Download frontend build artifact'
+
+                - powershell: |
+                    $target = "C:\Production"
+                    if (!(Test-Path $target)) {
+                        New-Item -ItemType Directory -Path $target | Out-Null
+                    }
+
+                    # Backend Django (checkout frais du repo)
+                    robocopy "$(Build.SourcesDirectory)\backend-django" "$target\backend-django" /MIR /XD venv __pycache__ .git
+                    if ($LASTEXITCODE -ge 8) {
+                        Write-Host "##vso[task.logissue type=error]Robocopy backend failed with code $LASTEXITCODE"
+                        exit 1
+                    }
+
+                    # Frontend (artifact téléchargé depuis le stage CI)
+                    robocopy "$(Pipeline.Workspace)\frontend-dist" "$target\front\dist" /MIR
+                    if ($LASTEXITCODE -ge 8) {
+                        Write-Host "##vso[task.logissue type=error]Robocopy frontend failed with code $LASTEXITCODE"
+                        exit 1
+                    }
+
+                    Write-Host "Déploiement Production terminé vers $target"
+                    exit 0
+                  displayName: 'Copy artifacts to Production'
+
+                - powershell: |
+                    $envContent = @"
+                    JWT_SECRET=$(JWT_SECRET)
+                    DB_HOST=localhost
+                    DB_PORT=5432
+                    DB_DATABASE=capex_platform
+                    DB_USER=postgres
+                    DB_PASSWORD=$(DB_PASSWORD1)
+                    DJANGO_DEBUG=False
+                    CORS_ORIGIN=http://localhost:5180
+                    FRONTEND_URL=http://localhost:5180
+                    "@
+                    Set-Content -Path "C:\Production\backend-django\.env" -Value $envContent
+                    Write-Host ".env Production généré avec succès"
+                  displayName: 'Generate Production .env file'
+
+                - powershell: |
+                    schtasks /end /tn "CapexBackendProd" 2>$null
+                    schtasks /end /tn "CapexFrontendProd" 2>$null
+                    Start-Sleep -Seconds 2
+                    schtasks /run /tn "CapexBackendProd"
+                    schtasks /run /tn "CapexFrontendProd"
+                    Start-Sleep -Seconds 8
+                    Write-Host "=================================="
+                    Write-Host "Application Production déployée !"
+                    Write-Host "URL : http://localhost:5180"
+                    Write-Host "=================================="
+                  displayName: 'Restart Production services'
